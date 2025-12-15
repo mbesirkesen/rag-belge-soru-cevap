@@ -21,7 +21,58 @@ from core import (
     context_is_relevant,
     reduce_repetition,
     build_prompt,
+    format_sources_by_document,
 )
+
+
+def clean_llm_output(text: str) -> str:
+    """
+    LLM çıktısını temizler: Prompt talimatlarını, kural açıklamalarını vs. kaldırır.
+    """
+    import re
+    
+    if not text or len(text) < 5:
+        return text
+    
+    # Prompt talimatlarını ve kuralları kaldır
+    lines = text.split('\n')
+    cleaned_lines = []
+    
+    skip_patterns = [
+        r'KRİTİK KURALLAR',
+        r'ÖNEMLİ:',
+        r'Bağlamda.*?çıkaramıyorum',
+        r'Sadece bağlamda.*?kullan',
+        r'varsayım yapma',
+        r'Örnek:',
+        r'^\d+\.\s+',  # 1. 2. gibi numaralı liste
+    ]
+    
+    for line in lines:
+        line_lower = line.lower()
+        should_skip = False
+        
+        for pattern in skip_patterns:
+            if re.search(pattern, line_lower):
+                should_skip = True
+                break
+        
+        if not should_skip and line.strip():
+            cleaned_lines.append(line)
+    
+    cleaned = '\n'.join(cleaned_lines)
+    
+    # Fazla boşlukları temizle
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    cleaned = re.sub(r' +', ' ', cleaned)
+    cleaned = cleaned.strip()
+    
+    # Eğer çok kısa kaldıysa orijinal metni döndür
+    if len(cleaned) < 10 and len(text) > 50:
+        return text.strip()
+    
+    return cleaned if cleaned else text.strip()
+
 
 def ui_answer(message, history_state, k_value, use_mmr, prompt_format, use_turkish_embedding):
     """
@@ -33,6 +84,16 @@ def ui_answer(message, history_state, k_value, use_mmr, prompt_format, use_turki
         history_state = []
 
     try:
+        # Query expansion: Eğitim soruları için daha spesifik kelimeler ekle
+        expanded_query = message
+        query_lower = message.lower()
+        # Eğitim soruları için CV'nin eğitim bölümünü bulmak için daha spesifik kelimeler
+        if any(kw in query_lower for kw in ["eğitim", "okul", "üniversite", "mezun", "bölüm", "cv", "özgeçmiş"]):
+            # Eğitim sorularında sadece eğitimle ilgili kelimeler kullan, proje kelimelerini kullanma
+            expanded_query = message + " üniversite okul mezun bölüm fakülte eğitim öğrenci lisans yüksek"
+        elif any(kw in query_lower for kw in ["beceri", "yetenek", "programlama", "dil"]):
+            expanded_query = message + " beceri yetenek programlama dil teknoloji araç"
+        
         # RAG İşlemleri
         retriever = get_retriever(
             PERSIST_DIR, 
@@ -40,25 +101,32 @@ def ui_answer(message, history_state, k_value, use_mmr, prompt_format, use_turki
             use_mmr=use_mmr,
             turkish_focused=use_turkish_embedding
         )
-        docs = retriever.invoke(message)
+        docs = retriever.invoke(expanded_query)
         context = safe_compose_context(docs)
+        
+        # Minimal debug (sadece hata durumlarında)
+        if not context or not context_is_relevant(message, context):
+            print(f"⚠️ Soru: '{message[:50]}...' - Context yetersiz veya ilgisiz")
+        
         llm = get_llm()
-        prompt = build_prompt(message, context, prompt_format)
+        prompt = build_prompt(message, context, prompt_format, sources=docs)
         
         if not context or not context_is_relevant(message, context):
             answer = "Bu belgeden çıkaramıyorum."
-            sources = []
+            sources_text = ""
         else:
             answer = llm.invoke(prompt).strip()
             answer = reduce_repetition(answer)
-            source_list = [d.metadata.get("source", "?") for d in docs]
-            source_list = list(dict.fromkeys(source_list))
-            sources = source_list
+            
+            # LLM çıktısını temizle: Prompt talimatlarını, kural açıklamalarını vs. kaldır
+            answer = clean_llm_output(answer)
+            
+            # Kaynakları belge bazında formatla
+            sources_text = format_sources_by_document(docs)
 
-        # Kaynakları ekle
-        if sources:
-            source_text = "\n".join(f"- {src}" for src in sources)
-            full_response = answer + f"\n\nKaynaklar:\n{source_text}"
+        # Kaynakları ekle (belge bazında gruplanmış)
+        if sources_text:
+            full_response = answer + f"\n\n📚 Kaynaklar:\n{sources_text}"
         else:
             full_response = answer
 
@@ -172,9 +240,9 @@ def build_demo():
                     clear = gr.Button("Temizle", scale=1)
 
         with gr.Accordion("Ayarlar", open=False):
-            k_slider = gr.Slider(minimum=1, maximum=10, value=4, step=1, label="k")
+            k_slider = gr.Slider(minimum=1, maximum=15, value=6, step=1, label="k (CV soruları için 8-10 önerilir)")
             mmr_checkbox = gr.Checkbox(value=True, label="MMR")
-            prompt_format = gr.Dropdown(["kısa", "madde", "özet_madde"], value="kısa", label="Format")
+            prompt_format = gr.Dropdown(["kısa", "madde", "özet_madde", "önce_sonuç"], value="kısa", label="Format")
             turkish_embedding = gr.Checkbox(value=False, label="TR Embedding")
 
         # --- OLAYLAR (EVENTS) ---

@@ -152,6 +152,84 @@ def format_source_list(docs: List[Document]) -> List[Tuple[str, str]]:
     return items
 
 
+def format_sources_by_document(docs: List[Document]) -> str:
+    """
+    Kaynakları belge bazında gruplayarak formatlar.
+    Her belge için sayfa bilgilerini toplar ve ayrı satırlarda gösterir.
+    
+    Returns:
+        Formatlanmış kaynak string'i
+    """
+    from collections import defaultdict
+    
+    # Belge bazında grupla: {source: [pages]}
+    doc_pages = defaultdict(set)
+    for d in docs:
+        source = d.metadata.get("source") or d.metadata.get("file_path") or "unknown"
+        # Sadece dosya adını al (tam yol yerine)
+        filename = os.path.basename(source)
+        
+        page = d.metadata.get("page")
+        if page is not None:
+            doc_pages[filename].add(page)
+        else:
+            # Sayfa yoksa boş set ile işaretle
+            if filename not in doc_pages:
+                doc_pages[filename] = set()
+    
+    # Formatla: Her belge için sayfaları sırala
+    lines = []
+    for filename, pages in sorted(doc_pages.items()):
+        if pages:
+            sorted_pages = sorted(pages)
+            if len(sorted_pages) == 1:
+                lines.append(f"📄 {filename} (sayfa {sorted_pages[0]})")
+            else:
+                # Birden fazla sayfa varsa aralık göster (örn: sayfa 3-5, 7, 9)
+                page_str = format_page_range(sorted_pages)
+                lines.append(f"📄 {filename} ({page_str})")
+        else:
+            lines.append(f"📄 {filename}")
+    
+    return "\n".join(lines) if lines else ""
+
+
+def format_page_range(pages: List[int]) -> str:
+    """
+    Sayfa listesini okunabilir formata çevirir.
+    Örnek: [1, 2, 3, 5, 7, 8] -> "1-3, 5, 7-8"
+    (Sadece sayfa numaralarını döndürür, "sayfa" kelimesi eklenmez)
+    """
+    if not pages:
+        return ""
+    
+    pages = sorted(set(pages))
+    if len(pages) == 1:
+        return str(pages[0])
+    
+    ranges = []
+    start = pages[0]
+    end = pages[0]
+    
+    for i in range(1, len(pages)):
+        if pages[i] == end + 1:
+            end = pages[i]
+        else:
+            if start == end:
+                ranges.append(str(start))
+            else:
+                ranges.append(f"{start}-{end}")
+            start = end = pages[i]
+    
+    # Son aralığı ekle
+    if start == end:
+        ranges.append(str(start))
+    else:
+        ranges.append(f"{start}-{end}")
+    
+    return ", ".join(ranges)
+
+
 def ensure_dirs():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(PERSIST_DIR, exist_ok=True)
@@ -208,15 +286,46 @@ def safe_compose_context(docs: List[Document], max_tokens: int = 1024) -> str:
 
 def context_is_relevant(query: str, context: str) -> bool:
     """
-    Çok basit bir uygunluk kontrolü: sorudan çıkan anahtar kelimelerin
+    Uygunluk kontrolü: sorudan çıkan anahtar kelimelerin
     en azından bir kısmı bağlamda geçmeli; değilse reddet.
+    CV ve kişisel bilgi soruları için daha esnek.
     """
+    if not context or len(context.strip()) < 20:
+        return False
+    
     q = " ".join(query.lower().split())
     c = context.lower()
+    
     # Türkçe stop sözcüklerin küçük bir alt kümesi
-    stops = {"ve", "ile", "da", "de", "mi", "bir", "için", "ne", "mı", "mü", "mü", "ya", "ama", "veya"}
+    stops = {"ve", "ile", "da", "de", "mi", "bir", "için", "ne", "mı", "mü", "ya", "ama", "veya", "nedir", "nelerdir", "misin", "misiniz", "özetler", "özet"}
+    
+    # CV/kişisel bilgi soruları için özel kelimeler
+    personal_keywords = {"eğitim", "üniversite", "okul", "mezun", "bölüm", "bölümü", "ad", "isim", "adım", "kimim", "kim", 
+                         "beceri", "yetenek", "proje", "deneyim", "iş", "çalışma", "sertifika", "dil", "iletişim", "telefon",
+                         "cv", "özgeçmiş", "bilgi", "detay", "hakkında"}
+    
+    # Eğer soru kişisel bilgi içeriyorsa ve context varsa, çok esnek ol
+    query_has_personal = any(kw in q for kw in personal_keywords)
+    if query_has_personal:
+        # CV soruları için çok toleranslı: context varsa genelde kabul et
+        # Sadece çok kısa context'leri reddet
+        if len(context.strip()) > 30:
+            # İki kelime bile eşleşirse kabul et
+            terms = [t for t in q.split() if t not in stops and len(t) > 2]
+            if terms:
+                hit = sum(1 for t in terms if t in c)
+                if hit >= 1:
+                    return True
+            # Hiç kelime eşleşmese bile, context uzunsa kabul et (çok toleranslı)
+            if len(context.strip()) > 100:
+                return True
+    
+    # Normal kontrol (diğer sorular için)
     terms = [t for t in q.split() if t not in stops and len(t) > 3]
     if not terms:
+        # Eğer soru çok kısa veya sadece stop kelimeler içeriyorsa, context varsa kabul et
+        if len(context.strip()) > 50:
+            return True
         return False
     hit = sum(1 for t in terms if t in c)
     return hit >= max(1, len(terms) // 3)
@@ -234,7 +343,7 @@ def reduce_repetition(text: str) -> str:
     return t
 
 
-def build_prompt(query: str, context: str, prompt_format: str = "kısa") -> str:
+def build_prompt(query: str, context: str, prompt_format: str = "kısa", sources: List[Document] = None) -> str:
     """
     Prompt oluşturur.
     
@@ -245,17 +354,31 @@ def build_prompt(query: str, context: str, prompt_format: str = "kısa") -> str:
             - "kısa": Kısa ve öz yanıt
             - "madde": Madde madde liste
             - "özet_madde": Önce 1 cümle özet, sonra 3 madde
+            - "önce_sonuç": Önce sonuç, sonra gerekçe
+        sources: Kaynak dokümanlar (her belgeden 1 cümle kuralı için)
     """
-    base_instruction = "Aşağıdaki bağlamı kullanarak soruya Türkçe yanıt ver. Bağlamda açık bilgi yoksa 'Bu belgeden çıkaramıyorum.' de."
+    base_instruction = "Bağlamı kullanarak soruya Türkçe yanıt ver. Bağlamda soruya doğrudan cevap verecek bilgi yoksa sadece 'Bu belgeden çıkaramıyorum.' yaz."
     
     if prompt_format == "kısa":
-        instruction = base_instruction + " Kısa ve öz bir yanıt ver.\n\n"
+        instruction = base_instruction + " Kısa ve net cevap ver.\n\n"
     elif prompt_format == "madde":
-        instruction = base_instruction + " Yanıtı kısa ve madde madde ver.\n\n"
+        instruction = base_instruction + " Yanıtı madde madde ver.\n\n"
     elif prompt_format == "özet_madde":
-        instruction = base_instruction + " Önce 1 cümle özet ver, sonra 3 madde halinde detaylandır.\n\n"
+        instruction = base_instruction + " Önce 1 cümle özet, sonra 3 madde halinde detaylandır.\n\n"
+    elif prompt_format == "önce_sonuç":
+        instruction = base_instruction + " Önce kısa sonuç (1-2 cümle), sonra gerekçesini açıkla.\n\n"
     else:
         instruction = base_instruction + "\n\n"
     
-    return f"{instruction}Soru: {query}\n\nBağlam:\n{context}"
+    # Her belgeden en az 1 cümle kuralı (çoklu kaynak varsa) - sadece özet_madde formatında
+    if sources and prompt_format == "özet_madde":
+        unique_sources = set()
+        for doc in sources:
+            source = doc.metadata.get("source") or "unknown"
+            unique_sources.add(os.path.basename(source))
+        
+        if len(unique_sources) > 1:
+            instruction += f"{len(unique_sources)} belgeden bilgi var, her birinden örnek ver.\n\n"
+    
+    return f"{instruction}Soru: {query}\n\nBağlam:\n{context}\n\nCevap:"
 
