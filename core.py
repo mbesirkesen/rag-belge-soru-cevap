@@ -57,28 +57,74 @@ def split_documents(documents: List[Document], chunk_size: int = 800, chunk_over
     return splitter.split_documents(documents)
 
 
-def get_embeddings():
-    # Small, CPU-friendly model
+def get_embeddings(turkish_focused: bool = False):
+    """
+    Embedding modeli döndürür.
+    
+    Args:
+        turkish_focused: True ise Türkçe odaklı çok dilli model kullanır
+    """
+    if turkish_focused:
+        # Türkçe için optimize edilmiş çok dilli model
+        return HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+    # Small, CPU-friendly model (varsayılan)
     return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 
-def build_or_update_vectorstore(chunks: List[Document], persist_directory: str = PERSIST_DIR) -> Chroma:
+def build_or_update_vectorstore(chunks: List[Document], persist_directory: str = PERSIST_DIR, turkish_focused: bool = False) -> Chroma:
     os.makedirs(persist_directory, exist_ok=True)
-    embeddings = get_embeddings()
+    embeddings = get_embeddings(turkish_focused=turkish_focused)
+    
     # If a store exists, add to it; otherwise create new
-    if os.listdir(persist_directory):
-        vectorstore = Chroma(persist_directory=persist_directory, embedding_function=embeddings)
-        vectorstore.add_documents(chunks)
-        # langchain-chroma 0.1+: otomatik kalıcı; persist() yok
-        return vectorstore
-    return Chroma.from_documents(chunks, embeddings, persist_directory=persist_directory)
+    # ChromaDB'nin varlığını kontrol etmek için daha güvenli yöntem
+    db_exists = False
+    try:
+        existing_files = os.listdir(persist_directory)
+        # ChromaDB en azından birkaç dosya oluşturur
+        db_exists = len(existing_files) > 0 and any(f.endswith('.sqlite3') or f == 'chroma.sqlite3' for f in existing_files)
+    except:
+        db_exists = False
+    
+    if db_exists:
+        try:
+            vectorstore = Chroma(persist_directory=persist_directory, embedding_function=embeddings)
+            vectorstore.add_documents(chunks)
+            # langchain-chroma 0.1+: otomatik kalıcı; persist() yok
+            return vectorstore
+        except Exception as e:
+            print(f"Varolan indekse ekleme hatası: {e}. Yeni indeks oluşturuluyor...")
+            # Hata varsa yeni oluştur
+            return Chroma.from_documents(chunks, embeddings, persist_directory=persist_directory)
+    else:
+        return Chroma.from_documents(chunks, embeddings, persist_directory=persist_directory)
 
 
-def get_retriever(persist_directory: str = PERSIST_DIR):
-    embeddings = get_embeddings()
+def get_retriever(persist_directory: str = PERSIST_DIR, k: int = 6, use_mmr: bool = True, turkish_focused: bool = False):
+    """
+    Retriever döndürür.
+    
+    Args:
+        persist_directory: ChromaDB dizin yolu
+        k: Döndürülecek doküman sayısı (3-6 arası önerilir)
+        use_mmr: True ise Maximum Marginal Relevance kullanır (çeşitlilik için)
+        turkish_focused: True ise Türkçe odaklı embedding modeli kullanır
+    """
+    embeddings = get_embeddings(turkish_focused=turkish_focused)
     vectorstore = Chroma(persist_directory=persist_directory, embedding_function=embeddings)
-    # MMR ile çeşitlilik; k artırıldı
-    return vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": 6, "fetch_k": 20, "lambda_mult": 0.5})
+    
+    if use_mmr:
+        # MMR ile çeşitlilik
+        fetch_k = max(k * 3, 20)  # fetch_k en az k*3 veya 20
+        return vectorstore.as_retriever(
+            search_type="mmr", 
+            search_kwargs={"k": k, "fetch_k": fetch_k, "lambda_mult": 0.5}
+        )
+    else:
+        # Basit similarity search
+        return vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": k}
+        )
 
 
 def discover_data_files(root_dir: str = DATA_DIR) -> List[str]:
@@ -186,4 +232,30 @@ def reduce_repetition(text: str) -> str:
     t = re.sub(r"\b(\w+)(?:\s+\1){1,}\b", r"\1", t, flags=re.IGNORECASE)
     t = re.sub(r"(\b\w+(?:\s+\w+){2,3}\b)(?:\s+\1){1,}", r"\1", t, flags=re.IGNORECASE)
     return t
+
+
+def build_prompt(query: str, context: str, prompt_format: str = "kısa") -> str:
+    """
+    Prompt oluşturur.
+    
+    Args:
+        query: Kullanıcı sorusu
+        context: Belge bağlamı
+        prompt_format: Prompt formatı seçeneği
+            - "kısa": Kısa ve öz yanıt
+            - "madde": Madde madde liste
+            - "özet_madde": Önce 1 cümle özet, sonra 3 madde
+    """
+    base_instruction = "Aşağıdaki bağlamı kullanarak soruya Türkçe yanıt ver. Bağlamda açık bilgi yoksa 'Bu belgeden çıkaramıyorum.' de."
+    
+    if prompt_format == "kısa":
+        instruction = base_instruction + " Kısa ve öz bir yanıt ver.\n\n"
+    elif prompt_format == "madde":
+        instruction = base_instruction + " Yanıtı kısa ve madde madde ver.\n\n"
+    elif prompt_format == "özet_madde":
+        instruction = base_instruction + " Önce 1 cümle özet ver, sonra 3 madde halinde detaylandır.\n\n"
+    else:
+        instruction = base_instruction + "\n\n"
+    
+    return f"{instruction}Soru: {query}\n\nBağlam:\n{context}"
 
