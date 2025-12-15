@@ -4,10 +4,11 @@ langchain-text-splitters==0.2.2
 chromadb==0.5.3
 pypdf==4.2.0
 sentence-transformers==2.6.1
-transformers==4.44.2
-tokenizers==0.19.1
+transformers>=4.57.0
+tokenizers>=0.22.0
 torch
 gradio==4.19.2
-langchain-huggingface==0.0.3
+langchain-huggingface
 pdfminer.six>=20231228
 langchain-chroma>=0.1.2
+python-dotenv>=1.0.0
