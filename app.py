@@ -22,6 +22,7 @@ from core import (
     reduce_repetition,
     build_prompt,
     format_sources_by_document,
+    fetch_weather_summary,
 )
 
 
@@ -74,7 +75,44 @@ def clean_llm_output(text: str) -> str:
     return cleaned if cleaned else text.strip()
 
 
-def ui_answer(message, history_state, k_value, use_mmr, prompt_format, use_turkish_embedding):
+def compose_memory_text(history_state: list[tuple[str, str]]) -> str:
+    """
+    Önceki konuşmaları kısa bir hafıza metnine çevirir.
+    """
+    if not history_state:
+        return ""
+
+    entries = history_state[-6:]
+    lines = []
+    for user_msg, bot_msg in entries:
+        lines.append(f"Kullanıcı: {user_msg}")
+        lines.append(f"Bot: {bot_msg}")
+
+    return "\n".join(lines)
+
+
+def reset_data_store() -> str:
+    import shutil
+
+    paths = [PERSIST_DIR, DATA_DIR]
+    for path in paths:
+        if os.path.exists(path):
+            shutil.rmtree(path, ignore_errors=True)
+
+    ensure_dirs()
+    return "Veri klasörleri temizlendi (chroma_db + data)."
+
+
+def ui_answer(
+    message,
+    history_state,
+    k_value,
+    use_mmr,
+    prompt_format,
+    use_turkish_embedding,
+    weather_city,
+    use_weather_api,
+):
     """
     Sohbet Fonksiyonu
     Input: Mesaj ve Gizli Geçmiş (history_state)
@@ -103,15 +141,38 @@ def ui_answer(message, history_state, k_value, use_mmr, prompt_format, use_turki
         )
         docs = retriever.invoke(expanded_query)
         context = safe_compose_context(docs)
+
+        # İsteğe bağlı: Hava durumu API özeti
+        api_summary = ""
+        if use_weather_api:
+            try:
+                api_text, is_real = fetch_weather_summary(weather_city)
+                api_summary = api_text
+            except Exception as api_err:
+                print(f"Hava durumu API hatası (UI): {api_err}")
         
         # Minimal debug (sadece hata durumlarında)
         if not context or not context_is_relevant(message, context):
             print(f"⚠️ Soru: '{message[:50]}...' - Context yetersiz veya ilgisiz")
-        
+
+        # Memory metnini hazırla
+        memory_text = compose_memory_text(history_state)
+
+        # Belge bağlamı + hafıza + API özeti tek promptta birleşsin
+        parts = []
+        if memory_text:
+            parts.append(f"Önceki konuşmalar:\n{memory_text}")
+        if context:
+            parts.append(f"Belge bağlamı:\n{context}")
+        if api_summary:
+            parts.append(f"API (hava durumu) özeti:\n{api_summary}")
+
+        full_context = "\n\n".join(parts).strip()
+
         llm = get_llm()
-        prompt = build_prompt(message, context, prompt_format, sources=docs)
+        prompt = build_prompt(message, full_context, prompt_format, sources=docs)
         
-        if not context or not context_is_relevant(message, context):
+        if not full_context or not context_is_relevant(message, full_context):
             answer = "Bu belgeden çıkaramıyorum."
             sources_text = ""
         else:
@@ -228,6 +289,8 @@ def build_demo():
                 )
                 upload_btn = gr.Button("İndeksi Güncelle", variant="primary")
                 upload_info = gr.Textbox(label="Durum", interactive=False)
+                data_reset_status = gr.Textbox(label="Veri Durumu", interactive=False)
+                clear_data_btn = gr.Button("Veri Temizle (chroma_db + data)", variant="secondary")
             
             with gr.Column(scale=2):
                 chatbot = gr.Chatbot(label="Sohbet", elem_id="chatbot")
@@ -240,10 +303,34 @@ def build_demo():
                     clear = gr.Button("Temizle", scale=1)
 
         with gr.Accordion("Ayarlar", open=False):
-            k_slider = gr.Slider(minimum=1, maximum=15, value=6, step=1, label="k (CV soruları için 8-10 önerilir)")
+            k_slider = gr.Slider(
+                minimum=1,
+                maximum=15,
+                value=6,
+                step=1,
+                label="k (CV soruları için 8-10 önerilir)",
+            )
             mmr_checkbox = gr.Checkbox(value=True, label="MMR")
-            prompt_format = gr.Dropdown(["kısa", "madde", "özet_madde", "önce_sonuç"], value="kısa", label="Format")
-            turkish_embedding = gr.Checkbox(value=False, label="TR Embedding")
+            prompt_format = gr.Dropdown(
+                ["kısa", "madde", "özet_madde", "önce_sonuç"],
+                value="kısa",
+                label="Format",
+            )
+            turkish_embedding = gr.Checkbox(
+                value=False,
+                label="TR Embedding",
+            )
+
+            gr.Markdown("### 🌤 Hava Durumu API Ayarları")
+            weather_city = gr.Textbox(
+                label="Şehir (hava durumu için)",
+                placeholder="Örn: İstanbul",
+                value="İstanbul",
+            )
+            use_weather_api = gr.Checkbox(
+                value=False,
+                label="Hava durumu API'sini kullan (OPENWEATHER_API_KEY yoksa MOCK veri döner)",
+            )
 
         # --- OLAYLAR (EVENTS) ---
         
@@ -253,13 +340,23 @@ def build_demo():
             inputs=[file_uploader], 
             outputs=[upload_info]
         )
+        clear_data_btn.click(fn=reset_data_store, inputs=None, outputs=[data_reset_status])
 
         # 2. Mesaj Gönderme
         # DİKKAT: inputs içinde 'chatbot' YOK. 'history_state' VAR.
         msg.submit(
             fn=ui_answer,
-            inputs=[msg, history_state, k_slider, mmr_checkbox, prompt_format, turkish_embedding],
-            outputs=[msg, chatbot, history_state] # Çıktı sırası: MesajKutusu, GörselChat, GizliState
+            inputs=[
+                msg,
+                history_state,
+                k_slider,
+                mmr_checkbox,
+                prompt_format,
+                turkish_embedding,
+                weather_city,
+                use_weather_api,
+            ],
+            outputs=[msg, chatbot, history_state],  # Çıktı sırası: MesajKutusu, GörselChat, GizliState
         )
 
         # 3. Temizle
@@ -270,8 +367,17 @@ def build_demo():
 
     return demo
 
+def _read_server_port() -> int:
+    raw = os.getenv("SERVER_PORT", "7860")
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"⚠️ SERVER_PORT değeri geçersiz: {raw}. Varsayılan 7860 kullanılacak.")
+        return 7860
+
+
 if __name__ == "__main__":
-    base_port = int(os.getenv("SERVER_PORT", "7860"))
+    base_port = _read_server_port()
     
     demo = build_demo()
     

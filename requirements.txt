@@ -12,3 +12,4 @@ langchain-huggingface
 pdfminer.six>=20231228
 langchain-chroma>=0.1.2
 python-dotenv>=1.0.0
+requests>=2.31.0

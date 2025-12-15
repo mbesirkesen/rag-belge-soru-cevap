@@ -1,6 +1,8 @@
 import os
 from typing import Iterable, List, Tuple
 
+import requests
+
 from langchain_community.document_loaders import PDFMinerLoader
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -381,4 +383,70 @@ def build_prompt(query: str, context: str, prompt_format: str = "kısa", sources
             instruction += f"{len(unique_sources)} belgeden bilgi var, her birinden örnek ver.\n\n"
     
     return f"{instruction}Soru: {query}\n\nBağlam:\n{context}\n\nCevap:"
+
+
+# --- Basit Hava Durumu API Yardımcıları ---
+
+def fetch_weather_summary(city: str | None = None) -> Tuple[str, bool]:
+    """
+    Basit hava durumu özeti döndürür.
+    Gerçek API kullanılabiliyorsa OpenWeatherMap'ten çeker,
+    aksi halde MOCK bir metin döner.
+
+    Returns:
+        (summary, is_real_api)
+    """
+    city = (city or "").strip() or "İstanbul"
+    api_key = os.getenv("OPENWEATHER_API_KEY")
+
+    # API anahtarı yoksa MOCK metin döndür
+    if not api_key:
+        summary = (
+            f"[MOCK] {city} için örnek hava durumu: gündüz 22°C, akşam 16°C, "
+            "hafif rüzgarlı ve parçalı bulutlu. Gerçek API anahtarı .env dosyasında "
+            "OPENWEATHER_API_KEY olarak ayarlanırsa gerçek veri kullanılacaktır."
+        )
+        return summary, False
+
+    try:
+        params = {
+            "q": city,
+            "appid": api_key,
+            "units": "metric",
+            "lang": "tr",
+        }
+        resp = requests.get(
+            "https://api.openweathermap.org/data/2.5/weather",
+            params=params,
+            timeout=6,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        main = data.get("main", {})
+        weather_list = data.get("weather") or []
+        weather_desc = weather_list[0].get("description") if weather_list else ""
+        temp = main.get("temp")
+        feels = main.get("feels_like")
+        humidity = main.get("humidity")
+
+        parts = []
+        if temp is not None:
+            parts.append(f"sıcaklık yaklaşık {round(float(temp))}°C")
+        if feels is not None:
+            parts.append(f"hissedilen {round(float(feels))}°C")
+        if weather_desc:
+            parts.append(weather_desc)
+        if humidity is not None:
+            parts.append(f"nem %{int(humidity)}")
+
+        summary = f"{city} için güncel hava durumu: " + ", ".join(parts) + "."
+        return summary, True
+    except Exception as e:
+        print(f"Hava durumu API hatası: {e}")
+        fallback = (
+            f"{city} için hava durumu API'den alınamadı. "
+            "Cevabı mümkün olduğunca sadece belgedeki bilgilere göre ver."
+        )
+        return fallback, False
 
